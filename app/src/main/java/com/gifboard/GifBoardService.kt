@@ -54,7 +54,11 @@ class GifBoardService : InputMethodService() {
         // Generous: if this elapses mid-reset the jar can be left empty, which sends the
         // next request out unconsented. The callbacks normally fire in milliseconds.
         private const val COOKIE_RESET_TIMEOUT_MS = 3000L
+        // Independent of the reset budget above: the recovery runs precisely because that one
+        // expired, so inheriting an already-elapsed deadline would defeat it.
+        private const val CONSENT_RESTORE_TIMEOUT_MS = 3000L
         private val HASH_FILE_NAME = Regex("[0-9a-f]{64}\\.gif")
+        private const val GOOGLE_DOMAIN = ".google.com"
     }
 
     enum class KeyboardMode {
@@ -912,7 +916,15 @@ class GifBoardService : InputMethodService() {
                 // completes before the request leaves, so a straggling response from an
                 // earlier session has nothing left to correlate against. Bounded, because
                 // a cookie callback that never fires must not wedge search entirely.
-                withTimeoutOrNull(COOKIE_RESET_TIMEOUT_MS) { resetCookieJar() }
+                if (withTimeoutOrNull(COOKIE_RESET_TIMEOUT_MS) { resetCookieJar() } == null) {
+                    // The reset was interrupted, which can leave the jar emptied but not yet
+                    // re-seeded. Restore consent before issuing the request, and await the write
+                    // rather than firing and forgetting: an unconsented request comes back as the
+                    // consent interstitial, which parses as zero GIFs rather than as an error.
+                    // Chromium applies cookie operations in order, so this lands after any
+                    // removal still in flight.
+                    withTimeoutOrNull(CONSENT_RESTORE_TIMEOUT_MS) { seedConsentCookies() }
+                }
 
                 val gifItems = gifProvider.search(query, 0, safeSearch, timeoutMs)
 
@@ -1145,8 +1157,8 @@ class GifBoardService : InputMethodService() {
                 if (cont.isActive) cont.resume(Unit)
             }
         }
-        cookieManager.setCookie(".google.com", GoogleConsentCookies.buildConsentCookie(), onWritten)
-        cookieManager.setCookie(".google.com", GoogleConsentCookies.buildSocsCookie(), onWritten)
+        cookieManager.setCookie(GOOGLE_DOMAIN, GoogleConsentCookies.buildConsentCookie(), onWritten)
+        cookieManager.setCookie(GOOGLE_DOMAIN, GoogleConsentCookies.buildSocsCookie(), onWritten)
     }
 
     /**
