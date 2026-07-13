@@ -100,9 +100,14 @@ class GoogleGifFetcher(private val webView: WebView) : GifProvider {
         val url = "$BASE_URL?$queryString"
         var isFinished = false
 
+        android.util.Log.i("GifDiag", "REQUEST url=$url")
+        android.util.Log.i("GifDiag", "REQUEST cookies=" +
+            (android.webkit.CookieManager.getInstance().getCookie("https://www.google.com") ?: "NONE"))
+
         val timeoutRunnable = Runnable {
             if (!isFinished && cont.isActive) {
                 isFinished = true
+                android.util.Log.w("GifDiag", "TIMEOUT after ${timeoutMs}ms")
                 cont.resume(emptyList())
             }
         }
@@ -125,6 +130,14 @@ class GoogleGifFetcher(private val webView: WebView) : GifProvider {
 
                     val isGifDataMatched = GIF_DATA_PATTERN.containsMatchIn(html)
                     val isEmptyStateMatched = EMPTY_STATE_PATTERN.containsMatchIn(html)
+
+                    val markers = listOf(
+                        "unusual traffic", "consent.google.com", "Before you continue",
+                        "recaptcha", "enablejs", "Our systems have detected",
+                        "id=\"captcha\"", "sorry/index"
+                    ).filter { html.contains(it, ignoreCase = true) }
+                    android.util.Log.i("GifDiag", "POLL len=${html.length} gif=$isGifDataMatched " +
+                        "empty=$isEmptyStateMatched markers=$markers head=${html.take(160).replace('\n',' ')}")
 
                     // Unified Regex check: Success vs Early Exit
                     when {
@@ -165,6 +178,7 @@ class GoogleGifFetcher(private val webView: WebView) : GifProvider {
 
             override fun onPageFinished(view: WebView?, finishedUrl: String?) {
                 super.onPageFinished(view, finishedUrl)
+                android.util.Log.i("GifDiag", "onPageFinished url=$finishedUrl isFinished=$isFinished")
                 if (isFinished || view == null) return
 
                 val currentUrl = finishedUrl ?: ""
