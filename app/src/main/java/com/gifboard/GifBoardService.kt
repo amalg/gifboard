@@ -35,6 +35,7 @@ import java.io.File
 import java.io.FileOutputStream
 import android.webkit.WebView
 import android.webkit.CookieManager
+import android.webkit.WebStorage
 
 /**
  * Main InputMethodService for the GIF IME.
@@ -225,14 +226,14 @@ class GifBoardService : InputMethodService() {
             
             val cookieManager = CookieManager.getInstance()
             cookieManager.setAcceptCookie(true)
+            // Results are parsed from google.com itself, so nothing we need is ever
+            // carried on a third-party cookie -- only trackers embedded in the page
+            // set those. Refusing them costs no functionality.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                cookieManager.setAcceptThirdPartyCookies(this, true)
+                cookieManager.setAcceptThirdPartyCookies(this, false)
             }
-            
-            // Bypass Google's cookie consent banner while rejecting all tracking.
-            // See GoogleConsentCookies for details on the two-cookie protocol.
-            cookieManager.setCookie(".google.com", GoogleConsentCookies.buildConsentCookie())
-            cookieManager.setCookie(".google.com", GoogleConsentCookies.buildSocsCookie())
+
+            seedConsentCookies()
         }
         (view as? ViewGroup)?.addView(headlessWebView)
         updateGifProvider()
@@ -1029,6 +1030,16 @@ class GifBoardService : InputMethodService() {
         clearSearchCaches()
     }
 
+    /**
+     * Bypasses Google's cookie consent banner while rejecting all tracking.
+     * See GoogleConsentCookies for details on the two-cookie protocol.
+     */
+    private fun seedConsentCookies() {
+        val cookieManager = CookieManager.getInstance()
+        cookieManager.setCookie(".google.com", GoogleConsentCookies.buildConsentCookie())
+        cookieManager.setCookie(".google.com", GoogleConsentCookies.buildSocsCookie())
+    }
+
     private fun clearSearchCaches() {
         scope.launch(Dispatchers.IO) {
             // Clear Fresco image cache (memory + disk)
@@ -1036,6 +1047,30 @@ class GifBoardService : InputMethodService() {
                 Fresco.getImagePipeline().clearCaches()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to clear Fresco caches", e)
+            }
+        }
+
+        // Google sets identifying cookies (NID etc.) on every search regardless of
+        // the reject-all consent state, which lets separate searches be linked to one
+        // another. Drop the whole jar between sessions. WebView state is main-thread only.
+        scope.launch(Dispatchers.Main) {
+            try {
+                if (::headlessWebView.isInitialized) {
+                    headlessWebView.clearCache(true)
+                    headlessWebView.clearHistory()
+                }
+                WebStorage.getInstance().deleteAllData()
+
+                val cookieManager = CookieManager.getInstance()
+                cookieManager.removeAllCookies {
+                    // removeAllCookies is asynchronous, so re-seed from its callback --
+                    // seeding inline would race the in-flight wipe and lose the consent
+                    // cookies, putting the next search back behind the banner.
+                    seedConsentCookies()
+                    cookieManager.flush()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to clear WebView state", e)
             }
         }
     }
