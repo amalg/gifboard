@@ -36,6 +36,7 @@ import java.io.FileOutputStream
 import android.webkit.WebView
 import android.webkit.CookieManager
 import android.webkit.WebStorage
+import kotlin.coroutines.resume
 
 /**
  * Main InputMethodService for the GIF IME.
@@ -47,6 +48,7 @@ class GifBoardService : InputMethodService() {
         private const val TAG = "GifBoardService"
         private const val PREFETCH_THRESHOLD = 8
         private const val DOUBLE_TAP_DELAY_MS = 300L
+        private const val COOKIE_RESET_TIMEOUT_MS = 2000L
     }
 
     enum class KeyboardMode {
@@ -848,6 +850,14 @@ class GifBoardService : InputMethodService() {
                 val safeSearch = prefs.getString("safe_search", "active") ?: "active"
                 val timeoutMs = prefs.getInt("search_timeout", 5) * 1000L
 
+                // Start each query from a clean jar, so whatever Google set during the
+                // previous search cannot be used to tie it to this one. Doing it here
+                // rather than only on dismissal is what makes it race-free: the reset
+                // completes before the request leaves, so a straggling response from an
+                // earlier session has nothing left to correlate against. Bounded, because
+                // a cookie callback that never fires must not wedge search entirely.
+                withTimeoutOrNull(COOKIE_RESET_TIMEOUT_MS) { resetCookieJar() }
+
                 val gifItems = gifProvider.search(query, 0, safeSearch, timeoutMs)
 
                 progressBar.visibility = View.GONE
@@ -1030,6 +1040,14 @@ class GifBoardService : InputMethodService() {
         clearSearchCaches()
     }
 
+    override fun onFinishInputView(finishingInput: Boolean) {
+        super.onFinishInputView(finishingInput)
+        // Hiding the keyboard or switching to another IME dismisses the view
+        // without finishing input, so onFinishInput never runs on those paths.
+        // When finishingInput is true onFinishInput follows and clears anyway.
+        if (!finishingInput) clearSearchCaches()
+    }
+
     /**
      * Bypasses Google's cookie consent banner while rejecting all tracking.
      * See GoogleConsentCookies for details on the two-cookie protocol.
@@ -1038,6 +1056,24 @@ class GifBoardService : InputMethodService() {
         val cookieManager = CookieManager.getInstance()
         cookieManager.setCookie(".google.com", GoogleConsentCookies.buildConsentCookie())
         cookieManager.setCookie(".google.com", GoogleConsentCookies.buildSocsCookie())
+    }
+
+    /**
+     * Empties the cookie jar and restores only the consent pair, suspending until the
+     * asynchronous removal has actually completed.
+     *
+     * Google re-identifies the jar on every search (NID, DV, __Secure-STRP) regardless of
+     * the reject-all SOCS cookie, which is what allows separate searches to be linked.
+     * Callers must await this before issuing a request, otherwise the re-seed races the
+     * in-flight wipe and the consent cookies are lost along with everything else.
+     */
+    private suspend fun resetCookieJar() = suspendCancellableCoroutine<Unit> { cont ->
+        val cookieManager = CookieManager.getInstance()
+        cookieManager.removeAllCookies {
+            seedConsentCookies()
+            cookieManager.flush()
+            if (cont.isActive) cont.resume(Unit)
+        }
     }
 
     private fun clearSearchCaches() {
@@ -1050,25 +1086,22 @@ class GifBoardService : InputMethodService() {
             }
         }
 
-        // Google sets identifying cookies (NID etc.) on every search regardless of
-        // the reject-all consent state, which lets separate searches be linked to one
-        // another. Drop the whole jar between sessions. WebView state is main-thread only.
         scope.launch(Dispatchers.Main) {
             try {
+                searchJob?.cancel()
                 if (::headlessWebView.isInitialized) {
+                    // stopLoading() only aborts the pending navigation. The document that
+                    // already loaded keeps running its JavaScript and keeps issuing
+                    // requests, each of which is answered with a fresh Set-Cookie -- so the
+                    // jar refills seconds after being emptied. Navigating away is what
+                    // actually destroys the page and stops it.
+                    headlessWebView.stopLoading()
+                    headlessWebView.loadUrl("about:blank")
                     headlessWebView.clearCache(true)
                     headlessWebView.clearHistory()
                 }
                 WebStorage.getInstance().deleteAllData()
-
-                val cookieManager = CookieManager.getInstance()
-                cookieManager.removeAllCookies {
-                    // removeAllCookies is asynchronous, so re-seed from its callback --
-                    // seeding inline would race the in-flight wipe and lose the consent
-                    // cookies, putting the next search back behind the banner.
-                    seedConsentCookies()
-                    cookieManager.flush()
-                }
+                resetCookieJar()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to clear WebView state", e)
             }
